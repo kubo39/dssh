@@ -1,0 +1,21 @@
+# dub
+.dub/
+dub.selections.json
+
+# object files and libraries
+*.o
+*.obj
+*.lst
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# built binaries (package name and test runners)
+/dssh
+*-test-*
+__test__*__
+
+# example executables
+examples/transport-interop/transport-interop

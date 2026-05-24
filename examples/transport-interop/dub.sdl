@@ -1,0 +1,4 @@
+name "transport-interop"
+description "Connect to a loopback sshd and verify the transport handshake interops."
+dependency "dssh:vibe" path="../.."
+targetType "executable"

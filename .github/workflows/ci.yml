@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [dmd-latest, ldc-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install OpenSSL dev libraries
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Install D (${{ matrix.compiler }})
+        uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ${{ matrix.compiler }}
+
+      - name: Unit tests (core)
+        run: dub test
+
+      - name: Unit tests (vibe adapter)
+        run: dub test :vibe
+
+  interop:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [dmd-latest, ldc-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install OpenSSL dev libraries
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Install D (${{ matrix.compiler }})
+        uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ${{ matrix.compiler }}
+
+      # End-to-end: build the client, stand up a loopback OpenSSH server in Docker, and
+      # verify handshake + known_hosts + publickey auth + exec. (ubuntu runners ship Docker.)
+      - name: Interop against real OpenSSH
+        run: bash examples/transport-interop/run-interop.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install D (LDC)
+        uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-latest
+
+      - name: Lint
+        run: dub lint
