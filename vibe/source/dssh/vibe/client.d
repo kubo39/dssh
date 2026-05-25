@@ -23,36 +23,87 @@ final class SshClient
     private SshChannel[uint] channels;
     private bool serviceRequested;
     private bool closed;
-    private ubyte[][] pending;
+
+    private TaskMutex stateMutex;   // guards incoming/fatal/pumpDone; backs `signal`
+    private TaskCondition signal;   // pump notifies on new events / handshake progress / exit
+    private TaskMutex writeMutex;   // serializes conn.write across the pump and callers
+    private ubyte[][] incoming;     // decrypted application payloads queued by the pump
+    private Exception fatal;        // set by the pump on a read/protocol failure
+    private bool pumpDone;          // the pump loop has exited
 
     static SshClient connect(string host, ushort port, SshConfig cfg)
     {
         auto c = new SshClient();
+        c.stateMutex = new TaskMutex;
+        c.signal = new TaskCondition(c.stateMutex);
+        c.writeMutex = new TaskMutex;
         c.conn = connectTCP(host, port);
         c.core = ProtocolCore(cfg, host, port);
         c.core.start();
-        c.flush();
+        c.flush();                         // send our banner + KEXINIT
+        c.pumpTask = runTask(&c.pumpLoop); // the pump drives the handshake from here on
 
-        ubyte[4096] buf;
-        while (!c.core.transportEstablished())
-        {
-            const n = c.conn.read(buf[], IOMode.once);
-            if (n == 0)
-                throw new SshConnectException("connection closed during handshake");
-            c.core.feedIncoming(buf[0 .. n]);
-            c.flush();
-        }
+        synchronized (c.stateMutex)
+            while (!c.core.transportEstablished() && c.fatal is null && !c.pumpDone)
+                c.signal.wait();
+        if (c.fatal !is null)
+            throw c.fatal;
+        if (!c.core.transportEstablished())
+            throw new SshConnectException("connection closed during handshake");
         return c;
     }
 
     /// Whether the transport handshake (banner + KEX + NEW_KEYS) is complete.
     bool transportEstablished() const { return core.transportEstablished(); }
 
+    // Background fiber: read the socket, advance the protocol, queue decrypted events.
+    private void pumpLoop() nothrow
+    {
+        ubyte[4096] buf;
+        try
+        {
+            for (;;)
+            {
+                const n = conn.read(buf[], IOMode.once);
+                if (n == 0)
+                    break; // peer closed the connection
+                core.feedIncoming(buf[0 .. n]);
+                auto events = core.takeEvents();
+                synchronized (stateMutex)
+                {
+                    if (events.length)
+                        incoming ~= events;
+                    signal.notifyAll(); // wake the handshake waiter and recvPacket
+                }
+                flush(); // push KEX/rekey responses and anything sendPacket queued
+            }
+        }
+        catch (Exception e)
+        {
+            try
+                synchronized (stateMutex) { if (fatal is null) fatal = e; }
+            catch (Exception)
+            {
+            }
+        }
+        try
+        {
+            synchronized (stateMutex) pumpDone = true;
+            signal.notifyAll();
+        }
+        catch (Exception)
+        {
+        }
+    }
+
     private void flush()
     {
-        auto outgoing = core.takeOutgoing();
-        if (outgoing.length)
-            conn.write(outgoing);
+        synchronized (writeMutex)
+        {
+            auto outgoing = core.takeOutgoing();
+            if (outgoing.length)
+                conn.write(outgoing);
+        }
     }
 
     /// Try each method in order until one succeeds; returns the last result otherwise.
@@ -107,21 +158,23 @@ final class SshClient
         }
     }
 
+    // Wait for the next decrypted application payload delivered by the pump.
     private const(ubyte)[] recvPacket()
     {
-        ubyte[4096] buf;
-        while (pending.length == 0)
+        synchronized (stateMutex)
         {
-            const n = conn.read(buf[], IOMode.once);
-            if (n == 0)
-                throw new SshConnectException("connection closed");
-            core.feedIncoming(buf[0 .. n]);
-            flush();
-            pending ~= core.takeEvents();
+            while (incoming.length == 0 && fatal is null && !pumpDone)
+                signal.wait();
+            if (incoming.length)
+            {
+                auto p = incoming[0];
+                incoming = incoming[1 .. $];
+                return p;
+            }
         }
-        auto p = pending[0];
-        pending = pending[1 .. $];
-        return p;
+        if (fatal !is null)
+            throw fatal;
+        throw new SshConnectException("connection closed");
     }
 
     SshChannel exec(string) { assert(0, "TODO: streaming channel"); }
@@ -231,7 +284,7 @@ final class SshClient
         }
     }
 
-    /// Send SSH_MSG_DISCONNECT, close the socket, and destroy the core (zeroizes keys).
+    /// Send SSH_MSG_DISCONNECT, close the socket, stop the pump, and destroy the core.
     void close()
     {
         if (closed)
@@ -249,6 +302,13 @@ final class SshClient
         }
         try
             conn.close();
+        catch (Exception)
+        {
+        }
+        // Let the pump observe the closed socket and exit before the core is destroyed
+        // (the pump touches core in feedIncoming/takeOutgoing).
+        try
+            pumpTask.join();
         catch (Exception)
         {
         }
