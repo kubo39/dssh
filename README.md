@@ -60,9 +60,10 @@ Experimental. Working today, all interoperating with real OpenSSH:
 - transport handshake: `curve25519-sha256`, `ssh-ed25519` host keys, `aes256-gcm@openssh.com`
 - host key verification: `knownHosts()` (plain / `[host]:port` / hashed), `acceptFingerprint()`
 - Ed25519 publickey authentication
-- remote command execution (`run()`, output buffered)
+- remote command execution: buffered `run()` and streaming `exec()` (stdin via `write`,
+  incremental `read`/`readStderr`, `waitExit`) over a background pump fiber
 - rekey: server-initiated and client-initiated (byte threshold)
 
-Not yet implemented: streaming channels / `exec` (only buffered `run()`), password &
+Not yet implemented: pty / interactive shell, SFTP, port forwarding, password &
 keyboard-interactive auth, encrypted private keys (bcrypt-pbkdf), RSA / ECDSA host keys,
-`chacha20-poly1305@openssh.com`, time-based rekey, port forwarding, server side.
+`chacha20-poly1305@openssh.com`, time-based rekey, server side.

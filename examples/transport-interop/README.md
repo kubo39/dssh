@@ -2,7 +2,7 @@
 
 Connects to a real OpenSSH server with `dssh:vibe` and verifies that the
 **transport handshake → host key verification (`known_hosts`) → publickey authentication →
-remote `exec`** interoperate.
+buffered `run()` → streaming `exec()` (a `cat` stdin/stdout round-trip)** interoperate.
 
 ## Run
 
@@ -19,8 +19,9 @@ remote `exec`** interoperate.
 5. runs the client (connect → KEX → **host key verified against `known_hosts`** → publickey auth → verify `echo` output)
 6. tears everything down
 
-On success it prints `OK: known_hosts-verified transport + publickey auth + exec ...` and exits 0.
-The host key step doubles as a real-OpenSSH test of `knownHosts()`.
+On success it prints `OK: known_hosts-verified transport + publickey auth + run() + streaming exec ...`
+and exits 0. The host key step doubles as a real-OpenSSH test of `knownHosts()`, and the `cat`
+round-trip exercises the streaming channel API (`write`/`closeStdin`/`readAll`/`waitExit`).
 
 ## Security
 
@@ -35,4 +36,4 @@ docker, ssh-keygen, dub/ldc2.
 ## Known limitations (MVP)
 
 - Run without a `known_hosts` argument, the client falls back to `insecureAcceptAll` (test only).
-- Only `run()` (collects all output); streaming `exec` is not implemented yet.
+- No pty / interactive shell yet; `exec` runs a single command.

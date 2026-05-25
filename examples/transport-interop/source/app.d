@@ -29,16 +29,30 @@ int main(string[] args)
                 msg = "FAIL: authentication rejected by server";
             else
             {
+                immutable how = knownHostsPath.length ? "known_hosts-verified " : "";
+
+                // 1) run(): buffered command, collect stdout + exit status.
                 auto cmd = sess.run("echo hello-from-dssh");
-                immutable stdout_ = cast(string) cmd.stdout;
-                if (stdout_ == "hello-from-dssh\n" && cmd.status.exited && cmd.status.code == 0)
+                immutable runOut = cast(string) cmd.stdout;
+                immutable runOk = runOut == "hello-from-dssh\n" && cmd.status.exited && cmd.status.code == 0;
+
+                // 2) streaming exec(): write to stdin and read it back through `cat`.
+                auto ch = sess.exec("cat");
+                ch.write(cast(const(ubyte)[]) "stream-payload\n");
+                ch.closeStdin();
+                immutable echoed = cast(string) ch.readAll();
+                immutable st = ch.waitExit();
+                ch.close();
+                immutable streamOk = echoed == "stream-payload\n" && st.exited && st.code == 0;
+
+                if (runOk && streamOk)
                 {
-                    immutable how = knownHostsPath.length ? "known_hosts-verified " : "";
-                    msg = "OK: " ~ how ~ "transport + publickey auth + exec (stdout matched, exit 0)";
+                    msg = "OK: " ~ how ~ "transport + publickey auth + run() + streaming exec (cat round-trip)";
                     rc = 0;
                 }
                 else
-                    msg = "FAIL: exec stdout=[" ~ stdout_ ~ "] exit=" ~ cmd.status.code.to!string;
+                    msg = "FAIL: run[" ~ runOut ~ "/" ~ cmd.status.code.to!string
+                        ~ "] stream[" ~ echoed ~ "/" ~ st.code.to!string ~ "]";
             }
         }
         catch (Exception e)

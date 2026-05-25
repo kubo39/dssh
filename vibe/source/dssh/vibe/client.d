@@ -9,6 +9,9 @@ import vibe.core.stream : IOMode;
 
 import dssh;
 
+private enum uint channelInitialWindow = 2 * 1024 * 1024;
+private enum uint channelMaxPacket = 32 * 1024;
+
 /// Primary entry point; delegates to SshClient.connect.
 SshClient connectSSH(string host, ushort port, SshConfig cfg)
 {
@@ -21,13 +24,14 @@ final class SshClient
     private Task pumpTask;
     private ProtocolCore core;
     private SshChannel[uint] channels;
+    private uint nextChannelId;
     private bool serviceRequested;
     private bool closed;
 
-    private TaskMutex stateMutex;   // guards incoming/fatal/pumpDone; backs `signal`
+    private TaskMutex stateMutex;   // guards incoming/fatal/pumpDone + all channel state; backs `signal`
     private TaskCondition signal;   // pump notifies on new events / handshake progress / exit
     private TaskMutex writeMutex;   // serializes conn.write across the pump and callers
-    private ubyte[][] incoming;     // decrypted application payloads queued by the pump
+    private const(ubyte)[][] incoming; // non-channel app payloads queued by the pump (auth, global)
     private Exception fatal;        // set by the pump on a read/protocol failure
     private bool pumpDone;          // the pump loop has exited
 
@@ -56,7 +60,7 @@ final class SshClient
     /// Whether the transport handshake (banner + KEX + NEW_KEYS) is complete.
     bool transportEstablished() const { return core.transportEstablished(); }
 
-    // Background fiber: read the socket, advance the protocol, queue decrypted events.
+    // Background fiber: read the socket, advance the protocol, route decrypted events.
     private void pumpLoop() nothrow
     {
         ubyte[4096] buf;
@@ -69,31 +73,32 @@ final class SshClient
                     break; // peer closed the connection
                 core.feedIncoming(buf[0 .. n]);
                 auto events = core.takeEvents();
-                synchronized (stateMutex)
                 {
-                    if (events.length)
-                        incoming ~= events;
-                    signal.notifyAll(); // wake the handshake waiter and recvPacket
+                    // `synchronized` is not nothrow (_d_monitorenter); TaskMutex.lock is, and
+                    // takes the same underlying lock, so it interoperates with synchronized.
+                    stateMutex.lock();
+                    scope (exit) stateMutex.unlock();
+                    foreach (ev; events)
+                        routeEvent(ev);
+                    signal.notifyAll(); // wake the handshake waiter, recvPacket, and channels
                 }
                 flush(); // push KEX/rekey responses and anything sendPacket queued
             }
         }
         catch (Exception e)
         {
-            try
-                synchronized (stateMutex) { if (fatal is null) fatal = e; }
-            catch (Exception)
-            {
-            }
+            // Surface the failure to everyone waiting on `signal`.
+            stateMutex.lock();
+            scope (exit) stateMutex.unlock();
+            if (fatal is null)
+                fatal = e;
         }
-        try
         {
-            synchronized (stateMutex) pumpDone = true;
-            signal.notifyAll();
+            stateMutex.lock();
+            scope (exit) stateMutex.unlock();
+            pumpDone = true;
         }
-        catch (Exception)
-        {
-        }
+        signal.notifyAll();
     }
 
     private void flush()
@@ -104,6 +109,78 @@ final class SshClient
             if (outgoing.length)
                 conn.write(outgoing);
         }
+    }
+
+    // Called under stateMutex (no yield). Channel messages go to their SshChannel;
+    // everything else (auth responses, global requests) is queued for recvPacket.
+    private SshChannel chan(uint id) { return channels.get(id, null); }
+
+    private void routeEvent(const(ubyte)[] ev)
+    {
+        if (ev.length == 0)
+            return;
+        auto b = SshBuffer(ev);
+        switch (cast(SshMsg) ev[0])
+        {
+        case SshMsg.channelOpenConfirmation:
+            auto m = ChannelOpenConfirmation.parse(b);
+            if (auto ch = chan(m.recipientChannel))
+                ch.onOpenConfirm(m.senderChannel, m.initialWindowSize, m.maximumPacketSize);
+            break;
+        case SshMsg.channelOpenFailure:
+            auto m = ChannelOpenFailure.parse(b);
+            if (auto ch = chan(m.recipientChannel))
+                ch.onOpenFailure(m.description);
+            break;
+        case SshMsg.channelData:
+            auto m = ChannelData.parse(b);
+            if (auto ch = chan(m.recipientChannel))
+                ch.onData(m.data);
+            break;
+        case SshMsg.channelExtendedData:
+            auto m = ChannelExtendedData.parse(b);
+            if (auto ch = chan(m.recipientChannel))
+                ch.onExtended(m.dataTypeCode, m.data);
+            break;
+        case SshMsg.channelWindowAdjust:
+            auto m = ChannelWindowAdjust.parse(b);
+            if (auto ch = chan(m.recipientChannel))
+                ch.onWindowAdjust(m.bytesToAdd);
+            break;
+        case SshMsg.channelEof:
+            auto m = ChannelEof.parse(b);
+            if (auto ch = chan(m.recipientChannel))
+                ch.onEof();
+            break;
+        case SshMsg.channelClose:
+            auto m = ChannelClose.parse(b);
+            if (auto ch = chan(m.recipientChannel))
+                ch.onClose();
+            break;
+        case SshMsg.channelRequest:
+            routeChannelRequest(ev);
+            break;
+        case SshMsg.channelSuccess:
+        case SshMsg.channelFailure:
+            break; // replies to our channel requests; not awaited yet
+        default:
+            incoming ~= ev; // auth, global requests, etc.
+        }
+    }
+
+    private void routeChannelRequest(const(ubyte)[] ev)
+    {
+        auto b = SshBuffer(ev);
+        b.readByte();
+        auto ch = chan(b.readUint32());
+        if (ch is null)
+            return;
+        const reqType = b.readStr();
+        b.readBool(); // want_reply
+        if (reqType == "exit-status")
+            ch.onExitStatus(cast(int) b.readUint32());
+        else if (reqType == "exit-signal")
+            ch.onExitSignal(b.readStr(), b.readBool(), b.readStr());
     }
 
     /// Try each method in order until one succeeds; returns the last result otherwise.
@@ -158,7 +235,7 @@ final class SshClient
         }
     }
 
-    // Wait for the next decrypted application payload delivered by the pump.
+    // Wait for the next non-channel application payload delivered by the pump.
     private const(ubyte)[] recvPacket()
     {
         synchronized (stateMutex)
@@ -177,111 +254,89 @@ final class SshClient
         throw new SshConnectException("connection closed");
     }
 
-    SshChannel exec(string) { assert(0, "TODO: streaming channel"); }
+    /// Open a session channel and start a command; returns a streaming channel.
+    SshChannel exec(string command)
+    {
+        auto ch = openSession();
+        SshBuffer eb;
+        ChannelRequestExec(ch.remoteId, false, command).serialize(eb);
+        core.sendPacket(eb.data);
+        flush();
+        return ch;
+    }
 
     /// Open a session channel, run a command, and collect stdout/stderr/exit status.
     CommandResult run(string command)
     {
-        enum uint localChannel = 0;
-        enum uint window = 2 * 1024 * 1024;
-        enum uint maxPacket = 32 * 1024;
-
-        SshBuffer ob;
-        ChannelOpen("session", localChannel, window, maxPacket).serialize(ob);
-        core.sendPacket(ob.data);
-        flush();
-
-        uint remoteChannel;
-        for (;;)
-        {
-            auto p = recvPacket();
-            const m = cast(SshMsg) p[0];
-            if (m == SshMsg.channelOpenConfirmation)
-            {
-                auto cb = SshBuffer(p);
-                remoteChannel = ChannelOpenConfirmation.parse(cb).senderChannel;
-                break;
-            }
-            if (m == SshMsg.channelOpenFailure)
-            {
-                auto cb = SshBuffer(p);
-                throw new SshChannelException("channel open failed: " ~ ChannelOpenFailure.parse(cb).description);
-            }
-            // ignore unrelated control messages (e.g. GLOBAL_REQUEST)
-        }
-
-        SshBuffer eb;
-        ChannelRequestExec(remoteChannel, false, command).serialize(eb);
-        core.sendPacket(eb.data);
-        flush();
+        auto ch = exec(command);
+        scope (exit)
+            ch.close();
 
         CommandResult result;
-        bool channelClosed;
-        while (!channelClosed)
+        for (;;)
         {
-            auto p = recvPacket();
-            switch (cast(SshMsg) p[0])
+            size_t consumed;
+            bool done;
+            synchronized (stateMutex)
             {
-            case SshMsg.channelData:
-                auto cb = SshBuffer(p);
-                auto d = ChannelData.parse(cb);
-                result.stdout ~= d.data;
-                adjustWindow(remoteChannel, cast(uint) d.data.length);
-                break;
-            case SshMsg.channelExtendedData:
-                auto cb = SshBuffer(p);
-                auto d = ChannelExtendedData.parse(cb);
-                if (d.dataTypeCode == SshExtendedDataType.stderr)
-                    result.stderr ~= d.data;
-                adjustWindow(remoteChannel, cast(uint) d.data.length);
-                break;
-            case SshMsg.channelRequest:
-                parseChannelRequest(p, result);
-                break;
-            case SshMsg.channelClose:
-                channelClosed = true;
-                break;
-            default:
-                break; // EOF, window adjust, global requests, etc.
+                while (ch.stdoutBuf.length == 0 && ch.stderrBuf.length == 0
+                       && !ch.closeReceived && fatal is null)
+                    signal.wait();
+                if (fatal !is null)
+                    throw fatal;
+                if (ch.stdoutBuf.length)
+                {
+                    result.stdout ~= ch.stdoutBuf;
+                    consumed += ch.stdoutBuf.length;
+                    ch.stdoutBuf = null;
+                }
+                if (ch.stderrBuf.length)
+                {
+                    result.stderr ~= ch.stderrBuf;
+                    consumed += ch.stderrBuf.length;
+                    ch.stderrBuf = null;
+                }
+                done = ch.closeReceived && ch.stdoutBuf.length == 0 && ch.stderrBuf.length == 0;
+                if (done)
+                    result.status = ch.exitStatus_;
             }
+            if (consumed)
+                ch.sendWindowAdjust(consumed);
+            if (done)
+                break;
         }
-
-        SshBuffer cb;
-        ChannelClose(remoteChannel).serialize(cb);
-        core.sendPacket(cb.data);
-        flush();
         return result;
     }
 
-    private void adjustWindow(uint channel, uint bytes)
+    private SshChannel openSession()
     {
-        if (bytes == 0)
-            return;
-        SshBuffer b;
-        ChannelWindowAdjust(channel, bytes).serialize(b);
-        core.sendPacket(b.data);
-        flush();
-    }
+        uint localId;
+        SshChannel ch;
+        synchronized (stateMutex)
+        {
+            localId = nextChannelId++;
+            ch = new SshChannel(this, localId);
+            channels[localId] = ch;
+        }
 
-    private static void parseChannelRequest(const(ubyte)[] payload, ref CommandResult result)
-    {
-        auto b = SshBuffer(payload);
-        b.readByte();   // message type
-        b.readUint32(); // recipient channel
-        const reqType = b.readStr();
-        b.readBool();   // want_reply
-        if (reqType == "exit-status")
+        SshBuffer ob;
+        ChannelOpen("session", localId, channelInitialWindow, channelMaxPacket).serialize(ob);
+        core.sendPacket(ob.data);
+        flush();
+
+        synchronized (stateMutex)
         {
-            result.status.exited = true;
-            result.status.code = cast(int) b.readUint32();
+            while (!ch.opened && !ch.openFailed && fatal is null)
+                signal.wait();
+            if (fatal !is null)
+                throw fatal;
+            if (ch.openFailed)
+            {
+                channels.remove(localId);
+                throw new SshChannelException("channel open failed: " ~ ch.openFailReason);
+            }
         }
-        else if (reqType == "exit-signal")
-        {
-            result.status.signaled = true;
-            result.status.signal = b.readStr();
-            result.status.coreDumped = b.readBool();
-            result.status.errorMsg = b.readStr();
-        }
+        return ch;
     }
 
     /// Send SSH_MSG_DISCONNECT, close the socket, stop the pump, and destroy the core.
@@ -316,22 +371,185 @@ final class SshClient
     }
 }
 
+/// A session channel. Data is delivered by the client's pump into per-channel buffers;
+/// reads/writes block on the client's condition. Flow control is the SSH window
+/// (not queue back-pressure), so the pump never blocks delivering here.
 final class SshChannel
 {
-    private ubyte[] inboundBuffer;
-    private ubyte[] stderrBuffer;
-    private bool eof_;
-    private TaskMutex mutex;
-    private TaskCondition dataOrEof;
+    private SshClient client;
+    private uint localId;
+    private uint remoteId;          // peer's channel number (recipient of our messages)
+    private uint remoteWindow;      // bytes we may still send to the peer
+    private uint remoteMaxPacket;
+    private ubyte[] stdoutBuf;
+    private ubyte[] stderrBuf;
+    private bool opened, openFailed;
+    private string openFailReason;
+    private bool eofReceived, closeReceived;
+    private bool exited;
+    private ExitStatus exitStatus_;
+    private bool closeSent;
 
-    void write(const(ubyte)[]) { assert(0, "TODO"); }
-    void closeStdin()          { assert(0, "TODO"); }
+    private this(SshClient client, uint localId)
+    {
+        this.client = client;
+        this.localId = localId;
+    }
 
-    ubyte[] read(size_t = size_t.max)       { assert(0, "TODO"); }
-    ubyte[] readStderr(size_t = size_t.max) { assert(0, "TODO"); }
-    ubyte[] readAll()                       { assert(0, "TODO"); }
-    bool eof() const { return eof_; }
+    // ---- pump side: called under client.stateMutex; the pump notifies once afterward ----
+    private void onOpenConfirm(uint sender, uint window, uint maxPkt)
+    {
+        remoteId = sender;
+        remoteWindow = window;
+        remoteMaxPacket = maxPkt;
+        opened = true;
+    }
+    private void onOpenFailure(string reason) { openFailReason = reason; openFailed = true; }
+    private void onData(const(ubyte)[] d) { stdoutBuf ~= d; }
+    private void onExtended(uint typeCode, const(ubyte)[] d)
+    {
+        if (typeCode == SshExtendedDataType.stderr)
+            stderrBuf ~= d;
+    }
+    private void onWindowAdjust(uint n) { remoteWindow += n; }
+    private void onEof() { eofReceived = true; }
+    private void onClose() { closeReceived = true; }
+    private void onExitStatus(int code)
+    {
+        exitStatus_.exited = true;
+        exitStatus_.code = code;
+        exited = true;
+    }
+    private void onExitSignal(string sig, bool coreDumped, string msg)
+    {
+        exitStatus_.signaled = true;
+        exitStatus_.signal = sig;
+        exitStatus_.coreDumped = coreDumped;
+        exitStatus_.errorMsg = msg;
+        exited = true;
+    }
 
-    ExitStatus waitExit() { assert(0, "TODO"); }
-    void close()          { assert(0, "TODO"); }
+    // ---- user side: acquire client.stateMutex; send packets outside the lock ----
+
+    /// Write to the command's stdin, respecting the peer's window.
+    void write(const(ubyte)[] data)
+    {
+        while (data.length)
+        {
+            uint n;
+            synchronized (client.stateMutex)
+            {
+                while (remoteWindow == 0 && !closeReceived && client.fatal is null)
+                    client.signal.wait();
+                if (client.fatal !is null)
+                    throw client.fatal;
+                if (closeReceived)
+                    throw new SshChannelException("channel closed");
+                const limit = remoteWindow < remoteMaxPacket ? remoteWindow : remoteMaxPacket;
+                n = cast(uint)(data.length < limit ? data.length : limit);
+                remoteWindow -= n;
+            }
+            SshBuffer b;
+            ChannelData(remoteId, data[0 .. n]).serialize(b);
+            client.core.sendPacket(b.data);
+            client.flush();
+            data = data[n .. $];
+        }
+    }
+
+    /// Signal stdin EOF (CHANNEL_EOF).
+    void closeStdin()
+    {
+        SshBuffer b;
+        ChannelEof(remoteId).serialize(b);
+        client.core.sendPacket(b.data);
+        client.flush();
+    }
+
+    /// Read up to `max` stdout bytes; empty result means EOF/close.
+    ubyte[] read(size_t max = size_t.max) { return readFrom(false, max); }
+
+    /// Read up to `max` stderr bytes; empty result means EOF/close.
+    ubyte[] readStderr(size_t max = size_t.max) { return readFrom(true, max); }
+
+    private ubyte[] readFrom(bool stderr, size_t max)
+    {
+        ubyte[] chunk;
+        size_t consumed;
+        synchronized (client.stateMutex)
+        {
+            auto buf() { return stderr ? &stderrBuf : &stdoutBuf; }
+            while (buf().length == 0 && !eofReceived && !closeReceived && client.fatal is null)
+                client.signal.wait();
+            if (client.fatal !is null)
+                throw client.fatal;
+            const avail = buf().length;
+            const n = max < avail ? max : avail;
+            chunk = (*buf())[0 .. n].dup;
+            *buf() = (*buf())[n .. $];
+            consumed = n;
+        }
+        if (consumed)
+            sendWindowAdjust(consumed);
+        return chunk;
+    }
+
+    /// Read stdout until EOF/close.
+    ubyte[] readAll()
+    {
+        ubyte[] all;
+        for (;;)
+        {
+            auto c = read();
+            if (c.length == 0)
+                break;
+            all ~= c;
+        }
+        return all;
+    }
+
+    bool eof() const { return eofReceived; }
+
+    /// Wait for the command to exit; returns its status.
+    ExitStatus waitExit()
+    {
+        synchronized (client.stateMutex)
+        {
+            while (!exited && !closeReceived && client.fatal is null)
+                client.signal.wait();
+            if (client.fatal !is null)
+                throw client.fatal;
+            return exitStatus_;
+        }
+    }
+
+    /// Send CHANNEL_CLOSE (idempotent).
+    void close()
+    {
+        synchronized (client.stateMutex)
+        {
+            if (closeSent)
+                return;
+            closeSent = true;
+        }
+        try
+        {
+            SshBuffer b;
+            ChannelClose(remoteId).serialize(b);
+            client.core.sendPacket(b.data);
+            client.flush();
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    // Replenish the peer's send window by the number of bytes we consumed.
+    private void sendWindowAdjust(size_t n)
+    {
+        SshBuffer b;
+        ChannelWindowAdjust(remoteId, cast(uint) n).serialize(b);
+        client.core.sendPacket(b.data);
+        client.flush();
+    }
 }
