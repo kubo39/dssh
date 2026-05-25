@@ -56,8 +56,9 @@ struct SecretBuf
         }
     }
 
-    ubyte[] opSlice() @trusted @nogc nothrow return { return p[0 .. len]; }
-    const(ubyte)[] opSlice() const @trusted @nogc nothrow return { return p[0 .. len]; }
+    // inout collapses the mutable/const accessors; immutable SecretBuf is unconstructible
+    // (the zeroizing destructor mutates), so that instantiation is never reached.
+    inout(ubyte)[] opSlice() inout @trusted @nogc nothrow return { return p[0 .. len]; }
 
     size_t length() const @safe @nogc nothrow { return len; }
 }
