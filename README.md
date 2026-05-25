@@ -62,8 +62,9 @@ Experimental. Working today, all interoperating with real OpenSSH:
 - Ed25519 publickey authentication
 - remote command execution: buffered `run()` and streaming `exec()` (stdin via `write`,
   incremental `read`/`readStderr`, `waitExit`) over a background pump fiber
+- interactive shell with a pseudo-terminal: `shell()` (+ `windowChange()`)
 - rekey: server-initiated and client-initiated (byte threshold)
 
-Not yet implemented: pty / interactive shell, SFTP, port forwarding, password &
+Not yet implemented: SFTP, port forwarding, password &
 keyboard-interactive auth, encrypted private keys (bcrypt-pbkdf), RSA / ECDSA host keys,
 `chacha20-poly1305@openssh.com`, time-based rekey, server side.

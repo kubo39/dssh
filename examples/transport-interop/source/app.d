@@ -45,14 +45,24 @@ int main(string[] args)
                 ch.close();
                 immutable streamOk = echoed == "stream-payload\n" && st.exited && st.code == 0;
 
-                if (runOk && streamOk)
+                // 3) shell() with a pty: drive an interactive login shell.
+                import std.string : indexOf;
+                auto sh = sess.shell("vt100", 80, 24);
+                sh.write(cast(const(ubyte)[]) "echo shell-pty-ok; exit\n");
+                immutable shellOut = cast(string) sh.readAll();
+                immutable shExit = sh.waitExit();
+                sh.close();
+                immutable shellOk = shellOut.indexOf("shell-pty-ok") >= 0 && shExit.exited;
+
+                if (runOk && streamOk && shellOk)
                 {
-                    msg = "OK: " ~ how ~ "transport + publickey auth + run() + streaming exec (cat round-trip)";
+                    msg = "OK: " ~ how ~ "transport + publickey auth + run() + streaming exec + pty shell";
                     rc = 0;
                 }
                 else
                     msg = "FAIL: run[" ~ runOut ~ "/" ~ cmd.status.code.to!string
-                        ~ "] stream[" ~ echoed ~ "/" ~ st.code.to!string ~ "]";
+                        ~ "] stream[" ~ echoed ~ "/" ~ st.code.to!string
+                        ~ "] shell[" ~ (shellOk ? "ok" : "bad") ~ "]";
             }
         }
         catch (Exception e)

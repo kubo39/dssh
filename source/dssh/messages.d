@@ -738,6 +738,113 @@ struct ChannelRequestExitSignal
     }
 }
 
+/// SSH_MSG_CHANNEL_REQUEST "pty-req" (RFC 4254 §6.2).
+struct ChannelRequestPtyReq
+{
+    uint recipientChannel;
+    bool wantReply;
+    string term;                  // TERM value, e.g. "xterm-256color"
+    uint widthChars;
+    uint heightRows;
+    uint widthPixels;
+    uint heightPixels;
+    const(ubyte)[] terminalModes; // encoded modes, TTY_OP_END (0)-terminated
+
+    void serialize(ref SshBuffer b) const @safe
+    {
+        b.putByte(SshMsg.channelRequest);
+        b.putUint32(recipientChannel);
+        b.putStr("pty-req");
+        b.putBool(wantReply);
+        b.putStr(term);
+        b.putUint32(widthChars);
+        b.putUint32(heightRows);
+        b.putUint32(widthPixels);
+        b.putUint32(heightPixels);
+        b.putString(terminalModes);
+    }
+
+    static ChannelRequestPtyReq parse(ref SshBuffer b) @safe
+    {
+        expectMsg(b, SshMsg.channelRequest);
+        ChannelRequestPtyReq m;
+        m.recipientChannel = b.readUint32();
+        if (b.readStr() != "pty-req")
+            throw new SshProtocolException("expected pty-req request");
+        m.wantReply = b.readBool();
+        m.term = b.readStr();
+        m.widthChars = b.readUint32();
+        m.heightRows = b.readUint32();
+        m.widthPixels = b.readUint32();
+        m.heightPixels = b.readUint32();
+        m.terminalModes = b.readString();
+        return m;
+    }
+}
+
+/// SSH_MSG_CHANNEL_REQUEST "shell" (RFC 4254 §6.5).
+struct ChannelRequestShell
+{
+    uint recipientChannel;
+    bool wantReply;
+
+    void serialize(ref SshBuffer b) const @safe
+    {
+        b.putByte(SshMsg.channelRequest);
+        b.putUint32(recipientChannel);
+        b.putStr("shell");
+        b.putBool(wantReply);
+    }
+
+    static ChannelRequestShell parse(ref SshBuffer b) @safe
+    {
+        expectMsg(b, SshMsg.channelRequest);
+        ChannelRequestShell m;
+        m.recipientChannel = b.readUint32();
+        if (b.readStr() != "shell")
+            throw new SshProtocolException("expected shell request");
+        m.wantReply = b.readBool();
+        return m;
+    }
+}
+
+/// SSH_MSG_CHANNEL_REQUEST "window-change" (RFC 4254 §6.7). want_reply is always false.
+struct ChannelRequestWindowChange
+{
+    uint recipientChannel;
+    uint widthChars;
+    uint heightRows;
+    uint widthPixels;
+    uint heightPixels;
+
+    void serialize(ref SshBuffer b) const @safe
+    {
+        b.putByte(SshMsg.channelRequest);
+        b.putUint32(recipientChannel);
+        b.putStr("window-change");
+        b.putBool(false);
+        b.putUint32(widthChars);
+        b.putUint32(heightRows);
+        b.putUint32(widthPixels);
+        b.putUint32(heightPixels);
+    }
+
+    static ChannelRequestWindowChange parse(ref SshBuffer b) @safe
+    {
+        expectMsg(b, SshMsg.channelRequest);
+        ChannelRequestWindowChange m;
+        m.recipientChannel = b.readUint32();
+        if (b.readStr() != "window-change")
+            throw new SshProtocolException("expected window-change request");
+        b.readBool(); // want_reply, always false
+        m.widthChars = b.readUint32();
+        m.heightRows = b.readUint32();
+        m.widthPixels = b.readUint32();
+        m.heightPixels = b.readUint32();
+        return m;
+    }
+}
+
 @safe unittest
 {
     auto m = ChannelOpen("session", 0, 2_097_152, 32_768);
@@ -807,4 +914,26 @@ struct ChannelRequestExitSignal
     auto m = ChannelRequestExitSignal(0, "TERM", false, "killed", "");
     SshBuffer b; m.serialize(b);
     assert(ChannelRequestExitSignal.parse(b) == m);
+}
+
+@safe unittest
+{
+    const(ubyte)[] modes = [0]; // TTY_OP_END only
+    auto m = ChannelRequestPtyReq(0, true, "xterm-256color", 80, 24, 0, 0, modes);
+    SshBuffer b; m.serialize(b);
+    assert(ChannelRequestPtyReq.parse(b) == m);
+}
+
+@safe unittest
+{
+    auto m = ChannelRequestShell(0, true);
+    SshBuffer b; m.serialize(b);
+    assert(ChannelRequestShell.parse(b) == m);
+}
+
+@safe unittest
+{
+    auto m = ChannelRequestWindowChange(0, 132, 43, 0, 0);
+    SshBuffer b; m.serialize(b);
+    assert(ChannelRequestWindowChange.parse(b) == m);
 }

@@ -265,6 +265,20 @@ final class SshClient
         return ch;
     }
 
+    /// Open a session channel with a pseudo-terminal and start the login shell.
+    SshChannel shell(string term = "xterm-256color", uint cols = 80, uint rows = 24)
+    {
+        auto ch = openSession();
+        SshBuffer pb;
+        ChannelRequestPtyReq(ch.remoteId, false, term, cols, rows, 0, 0, [cast(ubyte) 0]).serialize(pb);
+        core.sendPacket(pb.data);
+        SshBuffer sb;
+        ChannelRequestShell(ch.remoteId, false).serialize(sb);
+        core.sendPacket(sb.data);
+        flush();
+        return ch;
+    }
+
     /// Open a session channel, run a command, and collect stdout/stderr/exit status.
     CommandResult run(string command)
     {
@@ -462,6 +476,15 @@ final class SshChannel
     {
         SshBuffer b;
         ChannelEof(remoteId).serialize(b);
+        client.core.sendPacket(b.data);
+        client.flush();
+    }
+
+    /// Tell the peer the terminal dimensions changed (only meaningful with a pty).
+    void windowChange(uint cols, uint rows)
+    {
+        SshBuffer b;
+        ChannelRequestWindowChange(remoteId, cols, rows, 0, 0).serialize(b);
         client.core.sendPacket(b.data);
         client.flush();
     }
