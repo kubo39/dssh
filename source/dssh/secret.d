@@ -31,7 +31,6 @@ struct SecretBuf
 {
     private ubyte* p;
     private size_t len;
-    private size_t cap;
 
     @disable this(this);
 
@@ -40,9 +39,8 @@ struct SecretBuf
         p = cast(ubyte*) malloc(n);
         if (p !is null)
         {
-            cap = n;
             len = n;
-            secureZero(p, cap);
+            secureZero(p, len);
         }
     }
 
@@ -50,7 +48,7 @@ struct SecretBuf
     {
         if (p !is null) // also covers the moved-from (T.init) case
         {
-            secureZero(p, cap);
+            secureZero(p, len);
             free(p);
             p = null;
         }
