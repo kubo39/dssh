@@ -57,7 +57,7 @@ SshKey parseOpenSshPrivateKey(const(char)[] pem)
     if (b.readRaw(15) != cast(const(ubyte)[]) "openssh-key-v1\0")
         throw new SshProtocolException("bad OpenSSH key magic");
     if (b.readStr() != "none")
-        throw new SshProtocolException("encrypted OpenSSH keys are not supported yet");
+        throw new SshProtocolException("encrypted OpenSSH private keys are not supported");
     b.readStr();    // kdfname ("none")
     b.readString(); // kdfoptions (empty)
     if (b.readUint32() != 1)
@@ -78,13 +78,13 @@ SshKey parseOpenSshPrivateKey(const(char)[] pem)
     return SshKey(keyType, pub, seed);
 }
 
-/// Load a private key from a file. Encrypted keys (passphrase) are not supported yet.
-SshKey loadPrivateKey(string path, string passphrase = null)
+/// Load an unencrypted OpenSSH private key from a file. Encrypted (passphrase-protected)
+/// keys are not supported; decrypting them needs bcrypt-pbkdf, which we deliberately do
+/// not implement.
+SshKey loadPrivateKey(string path)
 {
     import std.file : readText;
 
-    if (passphrase.length)
-        throw new SshProtocolException("passphrase-protected keys are not supported yet (TODO bcrypt-pbkdf)");
     return parseOpenSshPrivateKey(readText(path));
 }
 
