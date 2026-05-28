@@ -51,6 +51,9 @@ final class AesGcmCipher : PacketCipher
     // Scrub the session key on destruction (deterministic via ProtocolCore.~this on close()).
     ~this() @nogc nothrow { secureZero(key[]); }
 
+    // Direct (non-vtable) call so unittests can read the key after destroy() to verify scrub.
+    package ubyte[32] sessionKeyForVerify() const @safe @nogc nothrow { return key; }
+
     size_t lengthFieldSize() const { return 4; }
 
     size_t trailingSize(const(ubyte)[] lengthField) const

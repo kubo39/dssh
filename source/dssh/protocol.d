@@ -196,7 +196,9 @@ struct ProtocolCore
             newkeys.serialize(ob);
             outbuf ~= tx.encryptPacket(ob.data);      // our NEWKEYS (still on the old tx)
             auto r = kex.result();
+            auto oldTx = tx;
             tx = new AesGcmCipher(r.encKeyClientToServer, r.ivClientToServer); // switch tx
+            destroy(oldTx);                            // scrub the previous c2s key now
             flushAppOutQueue();                        // app data may flow again under the new tx
             state = TransportState(AwaitingNewKeys());
             break;
@@ -216,7 +218,9 @@ struct ProtocolCore
         if (msg != SshMsg.newKeys)
             throw new SshProtocolException("expected NEWKEYS");
         auto r = kex.result();
+        auto oldRx = rx;
         rx = new AesGcmCipher(r.encKeyServerToClient, r.ivServerToClient); // switch rx
+        destroy(oldRx);                                  // scrub the previous s2c key now
         if (sessionId_.length == 0)
             sessionId_ = r.sessionId.dup; // fixed at the first KEX, preserved across rekeys
         state = TransportState(Established());
@@ -523,6 +527,119 @@ unittest // server-initiated rekey: new keys derived, session id preserved
     auto evts = core.takeEvents();
     assert(evts.length == 1);
     assert(evts[0] == payload);
+}
+
+unittest // rekey deterministically scrubs the previous session keys (forward secrecy)
+{
+    import dssh.crypto.openssl : ed25519Generate, ed25519Sign, x25519, x25519Generate;
+    import dssh.transport : exchangeHash, deriveKey;
+
+    SshConfig cfg;
+    cfg.clientVersion = "SSH-2.0-dssh";
+    cfg.hostKeyVerifier = (in HostKeyInfo) => HostKeyDecision.accept;
+    auto core = ProtocolCore(cfg);
+    core.start();
+
+    auto hostKey = ed25519Generate();
+    const(ubyte)[] vS = cast(const(ubyte)[]) "SSH-2.0-srv";
+    SshBuffer ksb;
+    ksb.putStr("ssh-ed25519");
+    ksb.putString(hostKey.publicKey[]);
+    const(ubyte)[] ksBlob = ksb.data;
+
+    KexInit sKex()
+    {
+        KexInit s;
+        s.kex = ["curve25519-sha256"];
+        s.serverHostKey = ["ssh-ed25519"];
+        s.encryptionC2S = ["aes256-gcm@openssh.com"];
+        s.encryptionS2C = ["aes256-gcm@openssh.com"];
+        s.compressionC2S = ["none"];
+        s.compressionS2C = ["none"];
+        return s;
+    }
+    const(ubyte)[] takeLine(ref ubyte[] b)
+    {
+        auto nl = b.countUntil(cast(ubyte) '\n');
+        size_t e = nl;
+        if (e > 0 && b[e - 1] == '\r') e--;
+        auto l = b[0 .. e];
+        b = b[nl + 1 .. $];
+        return l;
+    }
+    const(ubyte)[] take(PacketCipher c, ref ubyte[] b)
+    {
+        auto t = c.lengthFieldSize() + c.trailingSize(b[0 .. c.lengthFieldSize()]);
+        auto p = c.decryptPacket(b[0 .. t]);
+        b = b[t .. $];
+        return p;
+    }
+
+    auto plain = new PlaintextCipher;
+    auto out1 = core.takeOutgoing();
+    const(ubyte)[] vC = takeLine(out1);
+    const(ubyte)[] iC = take(plain, out1);
+
+    SshBuffer sk1b;
+    sKex().serialize(sk1b);
+    const(ubyte)[] iS = sk1b.data;
+    core.feedIncoming(cast(const(ubyte)[]) "SSH-2.0-srv\r\n");
+    core.feedIncoming(plain.encryptPacket(iS));
+
+    auto out2 = core.takeOutgoing();
+    auto eib = SshBuffer(take(plain, out2));
+    const(ubyte)[] qc = KexEcdhInit.parse(eib).clientPublicKey;
+    auto eph = x25519Generate();
+    auto K = x25519(eph.privateKey[], qc);
+    auto H = exchangeHash(vC, vS, iC, iS, ksBlob, qc, eph.publicKey[], K[]);
+    SshBuffer sig;
+    sig.putStr("ssh-ed25519");
+    sig.putString(ed25519Sign(hostKey.privateKey[], H[])[]);
+    SshBuffer rb;
+    KexEcdhReply(ksBlob, eph.publicKey[], sig.data).serialize(rb);
+    core.feedIncoming(plain.encryptPacket(rb.data));
+    SshBuffer nk;
+    NewKeys().serialize(nk);
+    core.feedIncoming(plain.encryptPacket(nk.data));
+    core.takeOutgoing(); // drain client NEWKEYS
+
+    auto sid = core.sessionId().dup;
+    auto sRead = new AesGcmCipher(deriveKey(K[], H[], sid, 'C', 32), deriveKey(K[], H[], sid, 'A', 12));
+    auto sWrite = new AesGcmCipher(deriveKey(K[], H[], sid, 'D', 32), deriveKey(K[], H[], sid, 'B', 12));
+
+    // Capture the live ciphers before rekey; both must be scrubbed by the rekey path.
+    auto oldTx = cast(AesGcmCipher) core.tx;
+    auto oldRx = cast(AesGcmCipher) core.rx;
+    assert(oldTx !is null && oldRx !is null);
+    ubyte[32] zero;
+    assert(oldTx.sessionKeyForVerify() != zero); // sanity: not already zero
+
+    // ----- server-initiated rekey -----
+    SshBuffer sk2b;
+    sKex().serialize(sk2b);
+    const(ubyte)[] iS2 = sk2b.data;
+    core.feedIncoming(sWrite.encryptPacket(iS2));
+    auto out4 = core.takeOutgoing();
+    const(ubyte)[] iC2 = take(sRead, out4);
+    auto eib2 = SshBuffer(take(sRead, out4));
+    const(ubyte)[] qc2 = KexEcdhInit.parse(eib2).clientPublicKey;
+    auto eph2 = x25519Generate();
+    auto K2 = x25519(eph2.privateKey[], qc2);
+    auto H2 = exchangeHash(vC, vS, iC2, iS2, ksBlob, qc2, eph2.publicKey[], K2[]);
+    SshBuffer sig2;
+    sig2.putStr("ssh-ed25519");
+    sig2.putString(ed25519Sign(hostKey.privateKey[], H2[])[]);
+    SshBuffer rb2;
+    KexEcdhReply(ksBlob, eph2.publicKey[], sig2.data).serialize(rb2);
+    core.feedIncoming(sWrite.encryptPacket(rb2.data));
+    SshBuffer nk2;
+    NewKeys().serialize(nk2);
+    core.feedIncoming(sWrite.encryptPacket(nk2.data));
+
+    // After rekey both old session keys must be zeroized; otherwise the previous
+    // key sits in the GC heap until a future collection (forward-secrecy gap).
+    assert(oldTx.sessionKeyForVerify() == zero);
+    assert(oldRx.sessionKeyForVerify() == zero);
 }
 
 unittest // a byte-volume threshold triggers a client-initiated rekey
