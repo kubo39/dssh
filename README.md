@@ -60,11 +60,14 @@ Experimental. Working today, all interoperating with real OpenSSH:
 - transport handshake: `curve25519-sha256`, `ssh-ed25519` host keys, `aes256-gcm@openssh.com`
 - host key verification: `knownHosts()` (plain / `[host]:port` / hashed), `acceptFingerprint()`
 - Ed25519 publickey authentication
+- encrypted private keys: `aes256-ctr` + `bcrypt-pbkdf`. The passphrase is interpreted as
+  its UTF-8 byte representation; a passphrase set with a different byte encoding will not
+  decrypt the key.
 - remote command execution: buffered `run()` and streaming `exec()` (stdin via `write`,
   incremental `read`/`readStderr`, `waitExit`) over a background pump fiber
 - interactive shell with a pseudo-terminal: `shell()` (+ `windowChange()`)
 - rekey: server-initiated and client-initiated (byte threshold)
 
 Not yet implemented: SFTP, port forwarding, password &
-keyboard-interactive auth, encrypted private keys (bcrypt-pbkdf), RSA / ECDSA host keys,
+keyboard-interactive auth, RSA / ECDSA host keys,
 `chacha20-poly1305@openssh.com`, time-based rekey, server side.

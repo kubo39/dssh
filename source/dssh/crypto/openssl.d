@@ -393,3 +393,36 @@ unittest // randomBytes fills the buffer with varying data
     randomBytes(b);
     assert(a != b);
 }
+
+/// AES-256-CTR decrypt. Used to unwrap the private section of an encrypted OpenSSH key
+/// (a stream cipher, so output length equals input length).
+ubyte[] aes256CtrDecrypt(scope const(ubyte)[] key, scope const(ubyte)[] iv,
+                         scope const(ubyte)[] ciphertext) @trusted
+{
+    assert(key.length == 32 && iv.length == 16);
+    auto ctx = EVP_CIPHER_CTX_new();
+    if (ctx is null)
+        throw new SshException("EVP_CIPHER_CTX_new failed");
+    scope (exit)
+        EVP_CIPHER_CTX_free(ctx);
+
+    check(EVP_DecryptInit_ex(ctx, EVP_aes_256_ctr(), null, key.ptr, iv.ptr), "DecryptInit");
+    auto outp = new ubyte[ciphertext.length];
+    int outl;
+    check(EVP_DecryptUpdate(ctx, outp.ptr, &outl, ciphertext.ptr,
+            cast(int) ciphertext.length), "DecryptUpdate");
+    int finalLen;
+    check(EVP_DecryptFinal_ex(ctx, outp.ptr + outl, &finalLen), "DecryptFinal");
+    return outp;
+}
+
+unittest // AES-256-CTR decrypt(encrypt(x)) == x (CTR is symmetric)
+{
+    ubyte[32] key = 0x11;
+    ubyte[16] iv = 0x22;
+    auto pt = cast(const(ubyte)[]) "the private section of an openssh key";
+    // Encrypt by running CTR over the plaintext, then decrypt the result.
+    auto ct = aes256CtrDecrypt(key[], iv[], pt);
+    assert(ct != pt);
+    assert(aes256CtrDecrypt(key[], iv[], ct) == pt);
+}
