@@ -285,9 +285,11 @@ struct ClientKex
     }
 
     /// On the server KEXINIT: negotiate, generate the ephemeral key, return KEX_ECDH_INIT.
+    /// Throws SshProtocolException if negotiation picks an algorithm this driver cannot run.
     KexEcdhInit onServerKexInit(in KexInit serverKexInit, const(ubyte)[] serverKexInitBytes)
     {
         negotiated_ = negotiate(clientKexInit, serverKexInit);
+        requireSupported(negotiated_);
         iS = serverKexInitBytes;
         ephemeral = x25519Generate();
         return KexEcdhInit(ephemeral.publicKey[]);
@@ -326,6 +328,24 @@ struct ClientKex
     bool established() const { return established_; }
     Negotiated negotiated() const { return negotiated_; }
     KexResult result() { return result_; }
+}
+
+// The config's algorithm lists are user-extendable, so negotiation can land on names this
+// driver does not implement; fail loudly here rather than installing the wrong cipher.
+private void requireSupported(in Negotiated n) @safe
+{
+    static void require(string got, string supported, string what) @safe
+    {
+        if (got != supported)
+            throw new SshProtocolException("negotiated unsupported " ~ what ~ ": " ~ got);
+    }
+
+    require(n.kex, "curve25519-sha256", "kex algorithm");
+    require(n.hostKey, "ssh-ed25519", "host key algorithm");
+    require(n.cipherC2S, "aes256-gcm@openssh.com", "client-to-server cipher");
+    require(n.cipherS2C, "aes256-gcm@openssh.com", "server-to-client cipher");
+    require(n.compressionC2S, "none", "client-to-server compression");
+    require(n.compressionS2C, "none", "server-to-client compression");
 }
 
 // Extract the raw key/signature from an SSH ed25519 blob: string(type) || string(bytes).
@@ -392,6 +412,26 @@ unittest // full client KEX against a simulated server: both sides derive the sa
     assert(r.encKeyClientToServer == deriveKey(kServer[], hServer[], hServer[], 'C', 32));
     assert(r.ivClientToServer.length == 12);
     assert(r.encKeyClientToServer.length == 32);
+}
+
+unittest // negotiating an algorithm we cannot run must fail, not silently use AES-GCM
+{
+    import std.exception : assertThrown;
+
+    KexInit cki;
+    cki.kex = ["curve25519-sha256"];
+    cki.serverHostKey = ["ssh-ed25519"];
+    cki.encryptionC2S = ["aes256-ctr"]; // negotiable, but ProtocolCore only implements GCM
+    cki.encryptionS2C = ["aes256-ctr"];
+    cki.macC2S = ["hmac-sha2-256"];
+    cki.macS2C = ["hmac-sha2-256"];
+    cki.compressionC2S = ["none"];
+    cki.compressionS2C = ["none"];
+    KexInit ski = cki;
+
+    auto kex = ClientKex(cast(const(ubyte)[]) "SSH-2.0-c", cast(const(ubyte)[]) "SSH-2.0-s",
+                         cki, [ubyte(1)]);
+    assertThrown!SshProtocolException(kex.onServerKexInit(ski, [ubyte(2)]));
 }
 
 unittest // KEX rejects an invalid host-key signature
