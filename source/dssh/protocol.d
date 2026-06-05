@@ -7,11 +7,12 @@ module dssh.protocol;
 
 import std.algorithm.searching : countUntil;
 import dssh.config : SshConfig;
-import dssh.exception : SshProtocolException, SshConnectException, SshHostKeyException;
+import dssh.exception : SshProtocolException, SshConnectException, SshHostKeyException,
+    SshDisconnectException;
 import dssh.hostkey : HostKeyInfo, HostKeyDecision, KnownHostStatus;
 import dssh.wire : SshBuffer;
-import dssh.messages : SshMsg, KexInit, KexEcdhInit, KexEcdhReply, NewKeys;
-import dssh.packet : PacketCipher, PlaintextCipher, AesGcmCipher;
+import dssh.messages : SshMsg, KexInit, KexEcdhInit, KexEcdhReply, NewKeys, Disconnect;
+import dssh.packet : PacketCipher, PlaintextCipher, AesGcmCipher, maxWirePacket;
 import dssh.transport : ClientKex, TransportState, VersionExchange, Kex, AwaitingNewKeys, Established;
 import dssh.crypto.openssl : randomBytes, sha256;
 import std.sumtype : match;
@@ -93,6 +94,8 @@ struct ProtocolCore
             if (inbuf.length < lfSize)
                 return;
             const total = lfSize + rx.trailingSize(inbuf[0 .. lfSize]);
+            if (total > maxWirePacket)
+                throw new SshProtocolException("SSH packet too large");
             if (inbuf.length < total)
                 return;
             auto payload = rx.decryptPacket(inbuf[0 .. total]);
@@ -166,6 +169,23 @@ struct ProtocolCore
         if (payload.length == 0)
             return;
         const msg = cast(SshMsg) payload[0];
+        // Transport-level chatter is valid in any post-banner state and must not leak to
+        // the upper layers (RFC 4253 §11): IGNORE/DEBUG/UNIMPLEMENTED are dropped,
+        // DISCONNECT ends the session.
+        switch (msg)
+        {
+        case SshMsg.ignore, SshMsg.debug_, SshMsg.unimplemented:
+            return;
+        case SshMsg.disconnect:
+            import std.conv : to;
+
+            auto b = SshBuffer(payload);
+            const d = Disconnect.parse(b);
+            throw new SshDisconnectException(
+                "disconnected by peer (" ~ d.reasonCode.to!string ~ "): " ~ d.description);
+        default:
+            break;
+        }
         state.match!(
             (VersionExchange _) { throw new SshProtocolException("packet before banner"); },
             (Kex _) => handleKex(msg, payload),
@@ -301,6 +321,134 @@ struct ProtocolCore
             end--;
         return s[0 .. end].idup;
     }
+}
+
+// Test scaffolding: drive the full handshake against a simulated server, leaving `core`
+// established and returning the server-side ciphers (read = c2s, write = s2c).
+version (unittest) private void establishTestTransport(ref ProtocolCore core,
+                                                       out AesGcmCipher serverRead,
+                                                       out AesGcmCipher serverWrite)
+{
+    import dssh.crypto.openssl : ed25519Generate, ed25519Sign, x25519, x25519Generate;
+    import dssh.transport : exchangeHash, deriveKey;
+
+    core.start();
+    auto plain = new PlaintextCipher;
+
+    // client banner + KEXINIT
+    auto out1 = core.takeOutgoing();
+    auto nl = out1.countUntil(cast(ubyte) '\n');
+    assert(nl >= 0);
+    size_t end = nl;
+    if (end > 0 && out1[end - 1] == '\r')
+        end--;
+    const(ubyte)[] vC = out1[0 .. end];
+    auto rest = out1[nl + 1 .. $];
+    const(ubyte)[] iC = plain.decryptPacket(rest[0 .. 4 + plain.trailingSize(rest[0 .. 4])]);
+
+    // server banner + KEXINIT
+    const(ubyte)[] vS = cast(const(ubyte)[]) "SSH-2.0-srv";
+    KexInit ski;
+    ski.kex = ["curve25519-sha256"];
+    ski.serverHostKey = ["ssh-ed25519"];
+    ski.encryptionC2S = ["aes256-gcm@openssh.com"];
+    ski.encryptionS2C = ["aes256-gcm@openssh.com"];
+    ski.compressionC2S = ["none"];
+    ski.compressionS2C = ["none"];
+    SshBuffer skib;
+    ski.serialize(skib);
+    const(ubyte)[] iS = skib.data;
+    core.feedIncoming(vS ~ cast(const(ubyte)[]) "\r\n");
+    core.feedIncoming(plain.encryptPacket(iS));
+
+    // client KEX_ECDH_INIT
+    auto out2 = core.takeOutgoing();
+    auto eib = SshBuffer(plain.decryptPacket(out2[0 .. 4 + plain.trailingSize(out2[0 .. 4])]));
+    const(ubyte)[] qc = KexEcdhInit.parse(eib).clientPublicKey;
+
+    // server KEX_ECDH_REPLY + NEW_KEYS
+    auto hostKey = ed25519Generate();
+    auto eph = x25519Generate();
+    auto K = x25519(eph.privateKey[], qc);
+    SshBuffer ksb;
+    ksb.putStr("ssh-ed25519");
+    ksb.putString(hostKey.publicKey[]);
+    auto H = exchangeHash(vC, vS, iC, iS, ksb.data, qc, eph.publicKey[], K[]);
+    SshBuffer sig;
+    sig.putStr("ssh-ed25519");
+    sig.putString(ed25519Sign(hostKey.privateKey[], H[])[]);
+    SshBuffer rb;
+    KexEcdhReply(ksb.data, eph.publicKey[], sig.data).serialize(rb);
+    core.feedIncoming(plain.encryptPacket(rb.data));
+    SshBuffer nk;
+    NewKeys().serialize(nk);
+    core.feedIncoming(plain.encryptPacket(nk.data));
+    assert(core.transportEstablished());
+    core.takeOutgoing(); // drain client NEWKEYS
+
+    serverRead = new AesGcmCipher(deriveKey(K[], H[], H[], 'C', 32), deriveKey(K[], H[], H[], 'A', 12));
+    serverWrite = new AesGcmCipher(deriveKey(K[], H[], H[], 'D', 32), deriveKey(K[], H[], H[], 'B', 12));
+}
+
+unittest // SSH_MSG_IGNORE / SSH_MSG_DEBUG are transport chatter, never app events
+{
+    import dssh.messages : SshMsg;
+
+    SshConfig cfg;
+    cfg.hostKeyVerifier = (in HostKeyInfo) => HostKeyDecision.accept;
+    auto core = ProtocolCore(cfg);
+    AesGcmCipher sRead, sWrite;
+    establishTestTransport(core, sRead, sWrite);
+
+    SshBuffer ig;
+    ig.putByte(SshMsg.ignore);
+    ig.putString(cast(const(ubyte)[]) "keepalive"); // RFC 4253 §11.2: string data
+    core.feedIncoming(sWrite.encryptPacket(ig.data));
+
+    SshBuffer dbg;
+    dbg.putByte(SshMsg.debug_);
+    dbg.putBool(false); // always_display
+    dbg.putStr("dbg");
+    dbg.putStr("");
+    core.feedIncoming(sWrite.encryptPacket(dbg.data));
+
+    assert(core.takeEvents().length == 0); // neither reaches the upper layer
+
+    // a real app payload afterwards still comes through (0xde is no transport msg number)
+    ubyte[] data = [0xde];
+    core.feedIncoming(sWrite.encryptPacket(data));
+    auto ev = core.takeEvents();
+    assert(ev.length == 1 && ev[0] == data);
+}
+
+unittest // SSH_MSG_DISCONNECT surfaces as SshDisconnectException, not an app event
+{
+    import std.exception : assertThrown;
+    import dssh.exception : SshDisconnectException;
+    import dssh.messages : Disconnect;
+
+    SshConfig cfg;
+    cfg.hostKeyVerifier = (in HostKeyInfo) => HostKeyDecision.accept;
+    auto core = ProtocolCore(cfg);
+    AesGcmCipher sRead, sWrite;
+    establishTestTransport(core, sRead, sWrite);
+
+    SshBuffer db;
+    Disconnect(2, "bye now", "").serialize(db); // SSH_DISCONNECT_PROTOCOL_ERROR
+    assertThrown!SshDisconnectException(core.feedIncoming(sWrite.encryptPacket(db.data)));
+}
+
+unittest // an absurd wire packet length is rejected instead of buffered indefinitely
+{
+    import std.exception : assertThrown;
+
+    SshConfig cfg;
+    cfg.hostKeyVerifier = (in HostKeyInfo) => HostKeyDecision.accept;
+    auto core = ProtocolCore(cfg);
+    core.start();
+    core.feedIncoming(cast(const(ubyte)[]) "SSH-2.0-srv\r\n");
+    // A hostile/corrupt length field of ~4 GiB must fail fast, not grow inbuf until OOM.
+    assertThrown!SshProtocolException(core.feedIncoming([ubyte(0xff), 0xff, 0xff, 0xff]));
 }
 
 unittest // full transport handshake against a simulated server, then an encrypted packet
