@@ -6,6 +6,11 @@ import dssh.exception : SshProtocolException;
 import dssh.crypto.openssl : OpenSslAesGcm, randomBytes;
 import dssh.secret : secureZero;
 
+/// Upper bound on a complete wire packet (length field + ciphertext + tag). The length
+/// field is attacker-influenced before authentication, so the framing layer must reject
+/// oversized claims instead of buffering toward them. Matches OpenSSH's 256 KiB limit.
+enum size_t maxWirePacket = 256 * 1024;
+
 interface PacketCipher
 {
     /// Frame and encrypt a payload into a complete wire packet.
@@ -93,6 +98,10 @@ final class AesGcmCipher : PacketCipher
         const encLen = bigEndianToNative!uint(lengthField);
         if (packet.length != 4 + encLen + tagLength)
             throw new SshProtocolException("SSH packet length mismatch");
+        // (padding_length || payload || padding) is at least one block and block-aligned
+        // (RFC 5647 framing); checked before decryption so plaintext[0] below is in bounds.
+        if (encLen < blockSize || encLen % blockSize != 0)
+            throw new SshProtocolException("bad SSH packet length");
 
         auto ciphertext = packet[4 .. 4 + encLen];
         ubyte[16] tag = packet[4 + encLen .. 4 + encLen + tagLength];
@@ -171,6 +180,27 @@ unittest // consecutive packets stay in sync as the IV advances
     assert(dec.decryptPacket(w2) == p2);
     // the same payload yields different ciphertext once the IV has advanced
     assert(enc.encryptPacket(p1) != enc.encryptPacket(p1));
+}
+
+unittest // encLen == 0 with a VALID tag is a protocol error, not a range crash
+{
+    import std.exception : assertThrown;
+
+    // An authenticated peer can frame a packet whose encrypted portion is empty; the
+    // padding byte then does not exist and naive plaintext[0] would be out of bounds.
+    ubyte[32] key;
+    foreach (i; 0 .. 32) key[i] = cast(ubyte) i;
+    ubyte[12] iv;
+    foreach (i; 0 .. 12) iv[i] = cast(ubyte)(0x10 + i);
+
+    auto gcm = new OpenSslAesGcm;
+    ubyte[4] lengthField = 0; // encLen == 0
+    ubyte[] ciphertext;
+    ubyte[16] tag;
+    gcm.seal(key[], iv[], lengthField[], null, ciphertext, tag);
+
+    auto dec = testCipher(); // same key/IV as the forged seal above
+    assertThrown!SshProtocolException(dec.decryptPacket(lengthField[] ~ tag[]));
 }
 
 unittest // a tampered tag fails authentication
