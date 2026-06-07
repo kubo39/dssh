@@ -1,18 +1,12 @@
 /// SSH exception hierarchy.
 module dssh.exception;
 
-private mixin template SshExceptionCtor()
-{
-    this(string msg, string file = __FILE__, size_t line = __LINE__) nothrow @safe
-    {
-        super(msg, file, line);
-    }
-}
+import std.exception : basicExceptionCtors;
 
-class SshException : Exception { mixin SshExceptionCtor; }
-class SshConnectException : SshException { mixin SshExceptionCtor; }
-class SshProtocolException : SshException { mixin SshExceptionCtor; }
-class SshDisconnectException : SshException { mixin SshExceptionCtor; }
-class SshChannelException : SshException { mixin SshExceptionCtor; }
-class SshHostKeyException : SshConnectException { mixin SshExceptionCtor; }
-class SshAuthException : SshException { mixin SshExceptionCtor; }
+class SshException : Exception { mixin basicExceptionCtors; }
+class SshConnectException : SshException { mixin basicExceptionCtors; }
+class SshProtocolException : SshException { mixin basicExceptionCtors; }
+class SshDisconnectException : SshException { mixin basicExceptionCtors; }
+class SshChannelException : SshException { mixin basicExceptionCtors; }
+class SshHostKeyException : SshConnectException { mixin basicExceptionCtors; }
+class SshAuthException : SshException { mixin basicExceptionCtors; }

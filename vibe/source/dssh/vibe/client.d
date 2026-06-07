@@ -259,7 +259,7 @@ final class SshClient
     {
         auto ch = openSession();
         SshBuffer eb;
-        ChannelRequestExec(ch.remoteId, false, command).serialize(eb);
+        ChannelRequestExec(ch.remoteId, wantReply: false, command: command).serialize(eb);
         core.sendPacket(eb.data);
         flush();
         return ch;
@@ -270,10 +270,12 @@ final class SshClient
     {
         auto ch = openSession();
         SshBuffer pb;
-        ChannelRequestPtyReq(ch.remoteId, false, term, cols, rows, 0, 0, [cast(ubyte) 0]).serialize(pb);
+        ChannelRequestPtyReq(ch.remoteId, wantReply: false, term: term,
+            widthChars: cols, heightRows: rows, widthPixels: 0, heightPixels: 0,
+            terminalModes: [cast(ubyte) 0]).serialize(pb);
         core.sendPacket(pb.data);
         SshBuffer sb;
-        ChannelRequestShell(ch.remoteId, false).serialize(sb);
+        ChannelRequestShell(ch.remoteId, wantReply: false).serialize(sb);
         core.sendPacket(sb.data);
         flush();
         return ch;

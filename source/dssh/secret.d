@@ -19,7 +19,7 @@ void secureZero(ubyte* p, size_t n) @system @nogc nothrow
     opensslCleanse(p, n);
 }
 
-/// Slice overload: @safe because the slice carries its own valid pointer and length.
+/// Slice overload. @trusted: the slice carries its own valid pointer and length.
 void secureZero(ubyte[] buf) @trusted @nogc nothrow
 {
     if (buf.length)
