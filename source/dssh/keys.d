@@ -143,14 +143,21 @@ SshKey parseOpenSshPrivateKey(const(char)[] pem, string passphrase)
     return parseInnerKey(aes256CtrDecrypt(keyiv[0 .. 32], keyiv[32 .. 48], ct));
 }
 
-/// Load an unencrypted OpenSSH private key from a file. Encrypted (passphrase-protected)
-/// keys are not supported; decrypting them needs bcrypt-pbkdf, which we deliberately do
-/// not implement.
+/// Load an unencrypted OpenSSH private key from a file. For encrypted
+/// (passphrase-protected) keys use the passphrase overload below.
 SshKey loadPrivateKey(string path)
 {
     import std.file : readText;
 
     return parseOpenSshPrivateKey(readText(path));
+}
+
+/// Load an encrypted OpenSSH private key (cipher aes256-ctr, kdf bcrypt) from a file.
+SshKey loadPrivateKey(string path, string passphrase)
+{
+    import std.file : readText;
+
+    return parseOpenSshPrivateKey(readText(path), passphrase);
 }
 
 unittest // parse a real unencrypted OpenSSH ed25519 private key
@@ -219,6 +226,31 @@ ITRjIDyFTQFDrD0R1aoFzRWzpEko/NRI7MUKA=
     assertThrown!SshProtocolException(parseOpenSshPrivateKey(pem, "wrong passphrase"));
     // An empty passphrase is rejected outright.
     assertThrown!SshProtocolException(parseOpenSshPrivateKey(pem, ""));
+}
+
+unittest // loadPrivateKey reads an encrypted key file when given the passphrase
+{
+    import std.file : write, remove, tempDir;
+    import std.path : buildPath;
+
+    // Same throwaway key as the parse test above; the passphrase is public on purpose.
+    enum pem = `-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABBipHzvtZ
+d1yl3FdicGbybpAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIFhGIR6ElR9Hel7t
+3PhUKXQFWdhyRcnEQckWWFabuBrLAAAAoJPtHVaxFlJklNCUQqRF0Evma8iteWEJ9ZX1hF
+ZM6YboMpfFaXbrQNDTqgosnNpCD+EoYng9X2ECrFHRBr8JCTa8L+fGRtE/xt11cd/I/EV5
+tQ82w6eUfsx2BjqgMZM3BbfBrw+HPf+b5Kr9wGbnH5FCYja6u1eALqpFO3RzUjy7VXj71h
+ITRjIDyFTQFDrD0R1aoFzRWzpEko/NRI7MUKA=
+-----END OPENSSH PRIVATE KEY-----`;
+
+    const path = buildPath(tempDir, "dssh_enc_key_test");
+    write(path, pem);
+    scope (exit)
+        remove(path);
+
+    auto key = loadPrivateKey(path, "correct horse");
+    assert(key.keyType == "ssh-ed25519");
+    assert(key.privateSeed.length == 32);
 }
 
 unittest // SshKey is non-copyable: the private seed lives in a move-only SecretBuf
