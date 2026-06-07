@@ -11,6 +11,5 @@ public import dssh.secret;
 public import dssh.packet;
 public import dssh.messages;
 public import dssh.transport;
-public import dssh.connection;
 public import dssh.protocol;
 public import dssh.crypto.api;
